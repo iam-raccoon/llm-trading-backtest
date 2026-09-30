@@ -82,6 +82,7 @@ ATR_N = 14
 COST = 0.20
 CAP_USD = 72.5
 DEADLINE = 240
+MIN_ORDER_USD = 5.0     # 이보다 작은 주문은 의미가 없어 건너뛴다(먼지 포지션 방지)
 
 
 def load_state():
@@ -418,11 +419,24 @@ def main(a):
             print(f"  돌파 후보 {len(cands)}개")
             picks = [(s_, nm, px, m) for m, s_, nm, px in cands
                      if s_ not in held_now][:max(free, 0)]
+            # ★ 슬롯 금액 = **전체 자산 ÷ 슬롯 수**.
+            # 전에는 `현금 ÷ 빈슬롯` 이었다. 그러면 현금이 적을 때 터무니없이 작은
+            # 주문이 나간다 — 2026-09-30 기준 현금 $21.87 / 빈슬롯 8 = **$2.73**.
+            # 게다가 1기 보유분은 슬롯 3 시절에 $24 씩 산 것이라 새 기준($7.5)보다
+            # 훨씬 크다. 그래서 **현금이 닿는 만큼만 사고**, 나머지 슬롯은 1기 종목이
+            # 정리되면서 자연히 채워지게 둔다(억지로 크기를 줄이지 않는다).
+            equity_now = st["cash"] + sum(
+                p2["qty"] * (ind[k][1]["close"] if k in ind else p2["entry"])
+                for k, p2 in st["pos"].items())
+            slot = equity_now / SLOTS
+            print(f"  슬롯 금액 ${slot:.2f} (자산 ${equity_now:.2f} ÷ {SLOTS}) "
+                  f"| 현금 ${st['cash']:.2f} → 최대 {int(st['cash'] // slot)}종목")
             for s_, nm, px, m in (picks if not a.signals else []):
-                slot = st["cash"] / max(free, 1)
                 amt = min(slot, st["cash"])
-                if amt < 1:
-                    continue
+                if amt < MIN_ORDER_USD:
+                    print(f"  · 현금 부족(${st['cash']:.2f}) — 남은 슬롯은 "
+                          f"기존 종목 정리 후 채운다")
+                    break
                 if live:
                     r = t.order(s_, side="BUY", market="US", amount=amt, confirm=True)
                     oid = ((r or {}).get("result") or {}).get("orderId")
