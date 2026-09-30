@@ -106,13 +106,22 @@ class Toss:
         req = urllib.request.Request(
             BASE + "/oauth2/token", data=body, method="POST",
             headers={"Content-Type": "application/x-www-form-urlencoded"})
-        try:
-            with urllib.request.urlopen(req, timeout=25) as r:
-                j = json.loads(r.read())
-        except urllib.error.HTTPError as e:
-            # ⚠️ 예외 본문에 키가 실릴 일은 없지만, 혹시 몰라 코드만 올린다.
-            raise TossError(f"토큰 발급 실패 HTTP {e.code}. "
-                            f"등록 IP({EXPECT_IP or '미지정'}) 불일치 가능") from None
+        # ⚠️ DNS 가 간헐적으로 튕겨 **토큰 발급부터** 죽어 봇이 시작도 못 한 날이 있다
+        # (2026-09-29/30). 여기에도 재시도를 넣는다.
+        j = None
+        for k in range(4):
+            try:
+                with urllib.request.urlopen(req, timeout=25) as r:
+                    j = json.loads(r.read())
+                break
+            except urllib.error.HTTPError as e:
+                # ⚠️ 예외 본문에 키가 실릴 일은 없지만, 혹시 몰라 코드만 올린다.
+                raise TossError(f"토큰 발급 실패 HTTP {e.code}. "
+                                f"등록 IP({EXPECT_IP or '미지정'}) 불일치 가능") from None
+            except Exception:
+                if k == 3:
+                    raise
+                time.sleep(2 * (k + 1))
         self._tok = j["access_token"]
         self._exp = time.time() + int(j.get("expires_in", 3600))
         return self._tok
@@ -149,6 +158,29 @@ class Toss:
                 if e.code == 429 and k < tries - 1:
                     time.sleep(2 * (k + 1))
                     continue
+                # ★ 401 token-revoked: 토스는 새 토큰을 발급하면 이전 토큰을 죽인다.
+                #   한 실행에서 Toss 객체를 두 번 만들어 서로 죽이는 바람에 **매수
+                #   주문이 거부**됐다(2026-09-29, 현금 3일간 유휴). 객체는 하나만
+                #   쓰도록 고쳤지만, 남은 경우(다른 프로세스가 토큰을 새로 받음)를
+                #   대비해 여기서도 복구한다. **요청이 거부된 것이므로** 주문이라도
+                #   재시도해도 중복되지 않는다.
+                if e.code == 401 and not getattr(self, "_retried_401", False):
+                    body_txt = ""
+                    try:
+                        body_txt = e.read().decode()
+                    except Exception:
+                        pass
+                    if "token-revoked" in body_txt or "revoked" in body_txt:
+                        self._retried_401 = True
+                        self._tok, self._exp = None, 0
+                        h["Authorization"] = f"Bearer {self._token()}"
+                        req2 = urllib.request.Request(url, data=data, headers=h,
+                                                     method=method)
+                        with urllib.request.urlopen(req2, timeout=30) as r:
+                            self._retried_401 = False
+                            return json.loads(r.read() or b"{}")
+                    e2 = urllib.error.HTTPError(e.url, e.code, body_txt, e.hdrs, None)
+                    return self._raise_http(e2, method, path)
                 return self._raise_http(e, method, path)
             except (urllib.error.URLError, TimeoutError, OSError):
                 if k < tries - 1:

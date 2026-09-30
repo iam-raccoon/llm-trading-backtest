@@ -47,8 +47,37 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(HERE, "cache", "us_trend_state.json")
 PXC = os.path.join(HERE, "cache", "v26_us_px.pkl")
 
-# v26 선정 — 고정. 바꾸지 않는다.
-DC_ENTRY, MA_TREND, CHAND, MOM, SLOTS = 40, 120, 3.0, 20, 3
+# ★ 2026-09-26: 고정값을 버리고 **분기 재선택 설정파일**을 읽는다.
+# 이유(v28/v29 워크포워드):
+#   · IS 성적 +177% 는 '그 구간에서 고른 이득'이었고 공정하게 재면 +45.9%(SR 0.64).
+#   · 창마다 최적 설정이 계속 바뀐다 — **고정된 최적값이 없다.**
+#   · 슬롯 3 은 IS·봉인 두 구간 모두 꼴찌였고 5·10 이 크게 나았다
+#     (봉인: 슬롯3 +74.0/SR1.07, 슬롯10 +150.3/SR1.86, 시장 +41.5/SR1.35).
+# 검증한 방식이 '분기 재선택'이므로 그대로 굴린다. 파라미터만 고정하면
+# 검증한 것과 다른 물건이 된다(v22 의 실패와 같은 함정).
+CONFIG = os.path.join(HERE, "cache", "us_trend_config.json")
+_DEFAULT = {"dc": 40, "ma": 120, "chand": 3.0, "mom": 20, "slots": 3}
+
+
+def load_config():
+    """분기 재선택 설정. 없거나 묵었으면 경고하되 멈추지는 않는다."""
+    cfg = dict(_DEFAULT)
+    try:
+        j = json.load(open(CONFIG, encoding="utf-8"))
+        cfg.update({k: j[k] for k in ("dc", "ma", "chand", "mom", "slots") if k in j})
+        cfg["chosen_at"] = j.get("chosen_at")
+        nr = j.get("next_review")
+        if nr and dt.date.fromisoformat(nr) < dt.date.today():
+            print(f"  ⚠️ 파라미터 재선택 예정일({nr})이 지났다 — us_reselect.py 실행 요망")
+    except Exception:
+        print(f"  ⚠️ 설정파일 없음 — 기본값 사용(슬롯 {cfg['slots']}). "
+              f"us_reselect.py 를 먼저 돌릴 것")
+    return cfg
+
+
+_C = load_config()
+DC_ENTRY, MA_TREND = _C["dc"], _C["ma"]
+CHAND, MOM, SLOTS = _C["chand"], _C["mom"], _C["slots"]
 ATR_N = 14
 COST = 0.20
 CAP_USD = 72.5
@@ -183,9 +212,14 @@ def toss_candles(t, sym, count=200):
     return d
 
 
-def fetch_all(syms):
-    from toss_trade import Toss
-    t = Toss()
+def fetch_all(syms, t=None):
+    """⚠️ `t` 를 반드시 넘길 것. 여기서 Toss() 를 새로 만들면 **새 토큰이 발급되어
+    호출부의 토큰이 죽는다**(토스는 신규 발급 시 이전 토큰 무효화). 실제로
+    2026-09-29 에 매도는 됐는데 매수가 401 token-revoked 로 거부되고 현금이
+    3일간 놀았다."""
+    if t is None:
+        from toss_trade import Toss
+        t = Toss()
 
     def one(it):
         s, n = it
@@ -276,7 +310,7 @@ def main(a):
     print(f"===== 미장 추세추종 {'[실주문]' if a.live else '[페이퍼]'}  {today} "
           f"(시작 {st['start']}) =====")
     print(f"  규칙: DC{DC_ENTRY} MA{MA_TREND} 샹들리에{CHAND}xATR 모멘텀{MOM} "
-          f"슬롯{SLOTS} 국면필터없음")
+          f"슬롯{SLOTS} 국면필터없음 (선택일 {_C.get('chosen_at', '기본값')})")
     print(f"  신호 기준: 미국 {us_today()} **이전** 완료 세션")
 
     # ── 하루 한 번 보장 ──
@@ -365,7 +399,7 @@ def main(a):
     if free > 0 or a.signals:
         syms = symbols()
         print(f"\n  빈 슬롯 {free} — 유니버스 {len(syms)}종목 조회...", flush=True)
-        ind = fetch_all(syms)
+        ind = fetch_all(syms, t)      # ★ 같은 객체 재사용(토큰 충돌 방지)
         print(f"  조회 {len(ind)}/{len(syms)}종목")
         ok_uni = len(ind) >= len(syms) * 0.7
         if not ok_uni:
