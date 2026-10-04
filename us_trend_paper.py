@@ -112,14 +112,55 @@ def symbols():
     raise RuntimeError("유니버스 캐시가 없다 — v26 데이터를 먼저 받을 것")
 
 
-def us_today():
-    """미국 동부 기준 '오늘' 날짜. 서머타임(EDT, UTC−4) 가정.
+# NYSE 휴장일·조기마감(13:00 ET). 출처: NYSE Group 2025~2027 공식 발표.
+# ⚠️ 2027 말에 2028 분을 추가할 것 — 없으면 휴장일에 주문이 나가 거부된다.
+NYSE_HOLIDAYS = {dt.date.fromisoformat(d) for d in (
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
+    "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24")}
+NYSE_EARLY_CLOSE = {dt.date.fromisoformat(d) for d in (
+    "2026-11-27", "2026-12-24", "2027-11-26")}
 
-    한국 밤 22:30 은 미국 당일 09:30 개장 시각이다. 즉 **장중에 실행된다.**
+
+def ny_now():
+    """미국 동부 현재 시각. **서머타임을 자동 반영한다.**
+
+    ⚠️ 전에는 UTC−4 고정이었다. 2026-11-01 서머타임이 끝나면 한국 22:40 은
+    뉴욕 08:40(개장 전)인데 코드는 09:40 이라고 믿었을 것이다."""
+    return pd.Timestamp.now(tz="America/New_York")
+
+
+def us_today():
+    """미국 동부 기준 '오늘' 날짜.
+
+    한국 밤 22:40 은 미국 당일 개장 직후(서머타임 기준)다. 즉 **장중에 실행된다.**
     이때 데이터 소스가 오늘의 **미완성 봉**을 마지막 행으로 줄 수 있는데,
     그걸 종가로 쓰면 신호가 백테스트와 달라진다(백테스트는 완료된 종가로 신호를
     만들고 다음 시가에 산다). 그래서 오늘 날짜 행은 잘라낸다."""
-    return (dt.datetime.utcnow() - dt.timedelta(hours=4)).date()
+    return ny_now().date()
+
+
+def is_session(d):
+    return d.weekday() < 5 and d not in NYSE_HOLIDAYS
+
+
+def market_window():
+    """지금 주문을 내도 되는가 → (bool, 사유).
+
+    정규장 개장 5분 뒤부터 **마감 1시간 전**까지만 허용한다. 소수점 시장가 매도는
+    마감 1시간 전까지만 되고, 금액 주문은 정규장 전용이다. 휴장일·장외에 돌면
+    주문이 거부되어 프로그램이 죽거나(9/30 의 422 처럼), 더 나쁘게는 프리마켓
+    같은 얇은 호가에 시장가가 나갈 수 있다."""
+    now = ny_now()
+    d = now.date()
+    if not is_session(d):
+        return False, f"뉴욕 {d} 휴장일"
+    t = now.time()
+    close = dt.time(12, 0) if d in NYSE_EARLY_CLOSE else dt.time(15, 0)
+    if not (dt.time(9, 35) <= t <= close):
+        return False, f"뉴욕 {now:%H:%M} — 주문 가능 시간(09:35~{close:%H:%M}) 밖"
+    return True, f"뉴욕 {now:%H:%M}"
 
 
 def indicators(d):
@@ -142,12 +183,13 @@ def indicators(d):
 
 
 def expected_session(today=None):
-    """직전 **완료** 미국 거래일(주말만 고려, 공휴일은 모른다).
+    """직전 **완료** 미국 거래일(주말·NYSE 휴장일 건너뜀).
 
     장중(09:30~16:00 ET)에 실행하므로 오늘 봉은 미완성이고, 신호는 어제(직전
-    영업일) 종가로 만들어야 한다."""
+    영업일) 종가로 만들어야 한다. 휴장일을 몰랐을 때는 휴장 다음 날 모든 보유
+    종목이 '데이터 묵음'으로 판정 보류되어 손절을 하루 놓쳤다."""
     d = (today or us_today()) - dt.timedelta(days=1)
-    while d.weekday() >= 5:            # 토·일 건너뛰기
+    while not is_session(d):
         d -= dt.timedelta(days=1)
     return d
 
@@ -278,6 +320,9 @@ def fetch_one(t, sym, since=None, tries=4):
                         dd = d[(d.index.date >= dt.date.fromisoformat(since))
                                & (d.index.date < us_today())]
                         x["peak_since"] = float(dd["High"].max()) if len(dd) else None
+                        # 캔들 200봉이 진입일까지 거슬러 올라가는가
+                        x["peak_covers"] = bool(
+                            len(d) and d.index[0].date() <= dt.date.fromisoformat(since))
                     return x
         except Exception:
             pass
@@ -310,8 +355,15 @@ def main(a):
       3. 조회가 반쯤 된 날 보유 종목이 빠져 평가액을 −70% 로 기록했다(실제 +7.65%).
          → 실주문 모드에선 **실계좌 잔고**로 평가액을 기록한다.
     """
+    # ★ 페이퍼 실행은 **별도 장부**에 쓴다. 전에는 `--live` 를 빼고 돌리면 실계좌
+    # 장부(us_trend_state.json)에 가짜 매매를 기록해 버렸다.
+    global STATE
+    if not a.signals and not (a.live and os.environ.get("TOSS_LIVE") == "1"):
+        STATE = STATE.replace(".json", "_paper.json")
     st = load_state()
-    today = dt.date.today().isoformat()
+    # ★ '오늘' = **뉴욕 날짜**. 한국 날짜를 쓰면 자정 넘은 예비 실행(겨울 00:40)이
+    # 같은 미국 세션을 '새 날'로 보고 한 번 더 매매한다.
+    today = us_today().isoformat()
     print(f"===== 미장 추세추종 {'[실주문]' if a.live else '[페이퍼]'}  {today} "
           f"(시작 {st['start']}) =====")
     print(f"  규칙: DC{DC_ENTRY} MA{MA_TREND} 샹들리에{CHAND}xATR 모멘텀{MOM} "
@@ -332,12 +384,30 @@ def main(a):
     if live and os.environ.get("TOSS_LIVE") != "1":
         print("  ⚠️ --live 인데 TOSS_LIVE!=1 — 페이퍼로만 진행")
         live = False
+    if live:
+        ok, why = market_window()
+        print(f"  장 시간 확인: {why}")
+        if not ok:
+            # last_ok 를 남기지 않는다 → 장중의 다음 예약 실행이 처리한다
+            print("  주문 불가 시간 — 아무것도 안 하고 종료")
+            return
+    # 주문이 하나라도 에러로 끝나면 last_ok 를 안 남겨 예비 실행이 다시 시도하게 한다.
+    # (체결분은 즉시 저장되고 실계좌와 대조하므로 다시 돌아도 중복 매매하지 않는다)
+    had_error = False
 
     # ── ① 보유 종목 청산 판정 (유니버스 조회와 무관하게 반드시) ──
     acct = account_positions(t) if live else {}
     exp = expected_session()
     for sym in list(st["pos"]):
         p = st["pos"][sym]
+        # ★ 오늘 산 종목은 판정하지 않는다 — 진입 뒤 완료된 봉이 아직 없다.
+        # 9/30 첫 실행이 MRNA 를 사고 죽은 뒤 예비 실행이 이걸 판정하면서
+        # **사기 전날(9/29) 고가 $208.90** 을 최고가로 넣었다. 손절선이
+        # $173.54 여야 할 것이 $181.75 로 $8 높게 박혀 일찍 털릴 뻔했다.
+        # (백테스트도 진입 봉이 **끝난 뒤**부터 최고가·손절을 잰다.)
+        if p.get("date") == today:
+            print(f"  · {sym:<6} 오늘 진입 — 판정은 내일부터")
+            continue
         x = fetch_one(t, sym, since=p.get("date"))
         if x is None:
             print(f"  ⚠️ {sym} 시세 조회 실패(재시도 4회) — 오늘 청산 판정 불가")
@@ -345,7 +415,14 @@ def main(a):
         if x["asof"] != exp and os.environ.get("ALLOW_STALE") != "1":
             print(f"  ⚠️ {sym} 데이터 {x['asof']} ≠ 예상 {exp} — 판정 보류")
             continue
-        p["peak"] = max(p["peak"], x["high"], x.get("peak_since") or 0)
+        # ★ 최고가는 **수정주가 캔들에서 매번 다시** 잰다. 저장된 peak 와 max 를
+        # 취하면, 액면분할 뒤 캔들은 분할 반영가인데 저장값은 옛 가격이라
+        # 손절선이 현재가 위로 올라가 **멀쩡한 종목을 시장가로 던진다.**
+        # 캔들이 진입일까지 못 거슬러 갈 때(보유 ~190일 초과)만 저장값을 섞는다.
+        if x.get("peak_since") and x.get("peak_covers"):
+            p["peak"] = x["peak_since"]
+        else:
+            p["peak"] = max(p["peak"], x["high"], x.get("peak_since") or 0)
         stop = p["peak"] - CHAND * x["atr"]
         p["stop"] = round(stop, 4)
         print(f"  · {sym:<6} 종가 ${x['close']:,.2f}  손절선 ${stop:,.2f}  "
@@ -363,9 +440,16 @@ def main(a):
                 exit_px, got = x["close"], 0.0
             else:
                 # 미장 시장가 매도는 소수점 수량 허용(정규장 마감 1시간 전까지)
-                r = t.order(sym, qty=q, side="SELL", market="US", confirm=True)
-                oid = ((r or {}).get("result") or {}).get("orderId")
-                fill = t.wait_fill(oid) if oid else None
+                # ⚠️ 예외를 여기서 잡는다. 안 잡으면 한 종목 매도 거부가 **나머지
+                # 종목의 손절 판정까지** 통째로 날린다.
+                try:
+                    r = t.order(sym, qty=q, side="SELL", market="US", confirm=True)
+                    oid = ((r or {}).get("result") or {}).get("orderId")
+                    fill = t.wait_fill(oid) if oid else None
+                except Exception as e:
+                    print(f"  ⚠️ {sym} 매도 주문 에러: {e} — 다음 실행 때 재시도")
+                    had_error = True
+                    continue
                 if fill and fill.get("qty"):
                     amt = fill.get("amount")
                     exit_px = (amt / fill["qty"]) if amt else x["close"]
@@ -374,6 +458,7 @@ def main(a):
                 else:
                     print(f"  ⚠️ {sym} 매도 체결 확인 실패({(fill or {}).get('status')}) "
                           f"— 장부 유지, 다음 실행 때 재시도")
+                    had_error = True
                     continue
         else:
             exit_px = x["close"]
@@ -436,17 +521,35 @@ def main(a):
             print(f"  슬롯 금액 ${slot:.2f} (자산 ${equity_now:.2f} ÷ {SLOTS}) "
                   f"| 현금 ${st['cash']:.2f} → 최대 {int(st['cash'] // slot)}종목")
             for s_, nm, px, m in (picks if not a.signals else []):
+                if live:
+                    # ★ 매수 직전마다 **실제 주문가능금액**을 다시 읽는다. 장부 차감
+                    # (`cash -= amt`)만 믿었더니 9/30 세 번째 매수가 422 로 거부됐다
+                    # (같은 금액이 1시간 뒤 예비 실행에선 체결 — 직전 체결분 정산 지연 추정).
+                    try:
+                        st["cash"] = float(t.buying_power("USD")["cashBuyingPower"])
+                    except Exception as e:
+                        print(f"  ⚠️ 주문가능금액 조회 실패: {e} — 매수 중단")
+                        had_error = True
+                        break
                 amt = min(slot, st["cash"])
                 if amt < MIN_ORDER_USD:
                     print(f"  · 현금 부족(${st['cash']:.2f}) — 남은 슬롯은 "
                           f"기존 종목 정리 후 채운다")
                     break
                 if live:
-                    r = t.order(s_, side="BUY", market="US", amount=amt, confirm=True)
-                    oid = ((r or {}).get("result") or {}).get("orderId")
-                    fill = t.wait_fill(oid) if oid else None
+                    try:
+                        r = t.order(s_, side="BUY", market="US", amount=amt,
+                                    confirm=True)
+                        oid = ((r or {}).get("result") or {}).get("orderId")
+                        fill = t.wait_fill(oid) if oid else None
+                    except Exception as e:
+                        # 거부된 주문이라 돈은 안 나갔다. 다음 후보로 넘어간다.
+                        print(f"  ⚠️ {s_} 매수 주문 에러: {e}")
+                        had_error = True
+                        continue
                     if not (fill and fill.get("qty") and fill.get("fill_price")):
                         print(f"  ⚠️ {s_} 매수 체결 확인 실패 — 기록 안 함")
+                        had_error = True
                         continue
                     qty, entry = fill["qty"], fill["fill_price"]
                     print(f"  ▶ [실매수] {s_} ${amt:.2f} → {qty:.6f}주 @${entry:,.2f} "
@@ -482,7 +585,14 @@ def main(a):
     clean = [c["ret"] for c in st["closed"] if not c.get("tainted")]
     if st["closed"]:
         print(f"  청산 {len(st['closed'])}건 (판정용·비오염 {len(clean)}건)")
-    st["equity"].append([today, round(mv, 4)])
+    if st["equity"] and st["equity"][-1][0] == today:
+        st["equity"][-1] = [today, round(mv, 4)]      # 같은 날 재실행은 덮어쓴다
+    else:
+        st["equity"].append([today, round(mv, 4)])
+    if had_error:
+        save_state(st)
+        print(f"  ⚠️ 주문 에러가 있었다 — last_ok 를 남기지 않음(예비 실행이 재시도)")
+        return
     st["last_ok"] = today           # ★ 여기까지 와야 '오늘 성공' — 예비 실행이 이걸 본다
     save_state(st)
     print(f"  {'실주문 모드' if live else '페이퍼 모드'} 종료 · last_ok={today}")

@@ -176,9 +176,15 @@ class Toss:
                         h["Authorization"] = f"Bearer {self._token()}"
                         req2 = urllib.request.Request(url, data=data, headers=h,
                                                      method=method)
-                        with urllib.request.urlopen(req2, timeout=30) as r:
+                        # 재시도가 실패해도 플래그는 풀어야 한다 — 안 풀면 이 객체는
+                        # 이후 401 을 다시는 복구하지 못한다.
+                        try:
+                            with urllib.request.urlopen(req2, timeout=30) as r:
+                                return json.loads(r.read() or b"{}")
+                        except urllib.error.HTTPError as e3:
+                            return self._raise_http(e3, method, path)
+                        finally:
                             self._retried_401 = False
-                            return json.loads(r.read() or b"{}")
                     e2 = urllib.error.HTTPError(e.url, e.code, body_txt, e.hdrs, None)
                     return self._raise_http(e2, method, path)
                 return self._raise_http(e, method, path)
@@ -189,13 +195,21 @@ class Toss:
                 raise
 
     def _raise_http(self, e, method, path):
+        # ⚠️ 2026-09-30 매수 거부가 "HTTP 422   " 로만 찍혀 원인을 알 수 없었다.
+        # 본문이 {"error": {...}} 꼴이 아니면 code/message 가 비므로 원문을 붙인다.
         try:
-            j = json.loads(e.read() or b"{}")
+            raw = e.read() or b""
+        except Exception:
+            raw = b""
+        try:
+            j = json.loads(raw or b"{}")
         except Exception:
             j = {}
         err = (j.get("error") or {}) if isinstance(j, dict) else {}
-        raise TossError(f"HTTP {e.code} {err.get('code','')} "
-                        f"{err.get('message','')} ({method} {path})") from None
+        code, msg = err.get("code", ""), err.get("message", "")
+        if not (code or msg):
+            msg = raw.decode("utf-8", "replace")[:300]
+        raise TossError(f"HTTP {e.code} {code} {msg} ({method} {path})") from None
 
     def _first_seq(self):
         r = self._call("GET", "/api/v1/accounts", need_acct=False).get("result") or []
