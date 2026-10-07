@@ -4,7 +4,7 @@
 
 **답: 아니오.** LLM에게 매매를 맡기는 구성 **7가지**(입력 3종 · 팩터 생성 · 리스크 게이트 · 최신 모델 교체 · 멀티에이전트)를 전부 시험했고 전부 기각됐다. 살아남은 건 LLM이 없는 규칙 전략 두 개다.
 
-실전 배포(젯슨 라이브)는 → **[edge-llm-trading-bot](https://github.com/iamracco0n/edge-llm-trading-bot)**. 여기서 결론 → 저기서 실행.
+실전 배포(젯슨 라이브)는 → **[edge-llm-trading-bot](https://github.com/iam-raccoon/edge-llm-trading-bot)**. 여기서 결론 → 저기서 실행.
 
 > 📊 크립토 **매매봇** 실험(v1~v4) → [RESULTS.md](RESULTS.md)
 > 📈 국내주식·PEAD·**팩터** 실험 + **크립토 팩터**(v6 · 저변동성 롱숏) → [RESULTS_KR.md](RESULTS_KR.md)
