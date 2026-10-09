@@ -451,8 +451,7 @@ def main(a):
                     had_error = True
                     continue
                 if fill and fill.get("qty"):
-                    amt = fill.get("amount")
-                    exit_px = (amt / fill["qty"]) if amt else x["close"]
+                    exit_px = fill.get("fill_price") or x["close"]   # 실제 평균 체결가
                     got = fill["qty"] * exit_px
                     print(f"  ▣ [실매도] {sym} {q:.6f}주 @${exit_px:,.2f}")
                 else:

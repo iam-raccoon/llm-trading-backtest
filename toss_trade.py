@@ -385,13 +385,23 @@ class Toss:
                 d = {}
             last = d
             st = str(d.get("status") or "").upper()
-            q = d.get("quantity")
+            # ★ 체결값은 `execution` 에서 읽는다. `quantity`·`orderAmount` 는 **주문 시점
+            # 추정치**다. 2026-10-09 실측: TEAM 주문 0.037513주/$7.70 → 체결 0.037426주
+            # @$205.73/$7.69, RVTY 매도 추정 $7.29 → 체결 $7.24(@$149.51, 장부엔 $150.38).
+            # 추정치를 쓰면 거래별 수익률 기록이 0.2~0.6%p 틀어진다.
+            ex = d.get("execution") or {}
+            q = ex.get("filledQuantity") or d.get("quantity")
             if st == "FILLED" and q:
                 qf = float(q)
-                amt = float(d.get("orderAmount") or 0) or None
-                px = (amt / qf) if (amt and qf) else (
-                    float(d["price"]) if d.get("price") else None)
-                return {"qty": qf, "fill_price": px, "amount": amt, "status": st}
+                amt = float(ex.get("filledAmount") or d.get("orderAmount") or 0) or None
+                if ex.get("averageFilledPrice"):
+                    px = float(ex["averageFilledPrice"])
+                else:
+                    px = (amt / qf) if (amt and qf) else (
+                        float(d["price"]) if d.get("price") else None)
+                return {"qty": qf, "fill_price": px, "amount": amt, "status": st,
+                        "commission": float(ex.get("commission") or 0),
+                        "tax": float(ex.get("tax") or 0)}
             if st in ("CANCELED", "CANCELLED", "REJECTED"):
                 return {"qty": 0.0, "fill_price": None, "amount": None, "status": st}
             _t.sleep(poll)
