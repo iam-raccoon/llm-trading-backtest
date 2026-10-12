@@ -56,6 +56,7 @@ PXC = os.path.join(HERE, "cache", "v26_us_px.pkl")
 # 검증한 방식이 '분기 재선택'이므로 그대로 굴린다. 파라미터만 고정하면
 # 검증한 것과 다른 물건이 된다(v22 의 실패와 같은 함정).
 CONFIG = os.path.join(HERE, "cache", "us_trend_config.json")
+CANDS_LOG = os.path.join(HERE, "cache", "us_cands_log.jsonl")     # 그림자 기록용 후보 목록
 _DEFAULT = {"dc": 40, "ma": 120, "chand": 3.0, "mom": 20, "slots": 3}
 
 
@@ -505,6 +506,20 @@ def main(a):
                             if x["close"] > x["dc"] and x["close"] > x["ma"]
                             and not np.isnan(x["mom"])), reverse=True)
             print(f"  돌파 후보 {len(cands)}개")
+            # ★ 그림자 기록용(v34): 오늘 돌파 후보 전체를 남긴다. 매매에는 안 쓴다.
+            # us_news_shadow.py 가 이 목록으로 최근 8-K 악재 여부를 따로 표시한다.
+            if live:
+                try:
+                    asof = max(x["asof"] for _, x in ind.values())
+                    with open(CANDS_LOG, "a", encoding="utf-8") as fo:
+                        fo.write(json.dumps({
+                            "us_date": today, "asof": str(asof),
+                            "cands": [{"sym": s_, "rank": k + 1, "mom": round(float(m), 4),
+                                       "close": round(float(px), 4)}
+                                      for k, (m, s_, nm, px) in enumerate(cands)],
+                            "held": sorted(held_now)}, ensure_ascii=False) + "\n")
+                except Exception as e:
+                    print(f"  (그림자 기록 실패, 매매와 무관: {e})")
             picks = [(s_, nm, px, m) for m, s_, nm, px in cands
                      if s_ not in held_now][:max(free, 0)]
             # ★ 슬롯 금액 = **전체 자산 ÷ 슬롯 수**.
