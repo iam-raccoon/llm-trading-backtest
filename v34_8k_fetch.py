@@ -14,6 +14,8 @@
 """
 import html
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import os
 import pickle
 import re
@@ -33,14 +35,23 @@ GAP = 0.13
 MAX_DOC_BYTES = 3_000_000
 
 _last = [0.0]
+_lock = threading.Lock()
+WORKERS = 6
+
+
+def _pace():
+    """여러 스레드가 같이 써도 전체 요청 간격이 GAP 이상이 되게 한다(초당 8회 이하)."""
+    with _lock:
+        nxt = max(time.time(), _last[0] + GAP)
+        _last[0] = nxt
+    d = nxt - time.time()
+    if d > 0:
+        time.sleep(d)
 
 
 def get(url, tries=5):
     for k in range(tries):
-        wait = GAP - (time.time() - _last[0])
-        if wait > 0:
-            time.sleep(wait)
-        _last[0] = time.time()
+        _pace()
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA,
                                                        "Accept-Encoding": "identity"})
@@ -113,6 +124,28 @@ def filings_8k(cik):
     return rows
 
 
+def one_filing(cik, tk, r, lm):
+    accn = r["acc"].replace("-", "")
+    idx = get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{accn}/index.json")
+    names = []
+    if idx:
+        items = json.loads(idx).get("directory", {}).get("item", [])
+        names = [x["name"] for x in items]
+    docs = [r["primary"]] if r["primary"] else []
+    docs += [n for n in names if re.search(r"ex[-_]?99", n, re.I)
+             and n.lower().endswith((".htm", ".html", ".txt")) and n not in docs]
+    tot = {"words": 0, "neg": 0, "pos": 0, "unc": 0, "lit": 0}
+    for dname in docs[:4]:
+        raw = get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{accn}/{dname}")
+        if raw:
+            for k, v in score(raw, lm).items():
+                tot[k] += v
+    return {"ticker": tk, "cik": cik, **r, "ndocs": len(docs[:4]), **tot}
+
+
+wlock = threading.Lock()
+
+
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     lm = load_dict()
@@ -134,29 +167,14 @@ def main():
             except Exception as e:
                 print(f"  ⚠ {tk} 목록 실패 {e}", flush=True)
                 continue
-            for r in rows:
-                if r["acc"] in done:
-                    continue
-                accn = r["acc"].replace("-", "")
-                idx = get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{accn}/index.json")
-                names = []
-                if idx:
-                    items = json.loads(idx).get("directory", {}).get("item", [])
-                    names = [x["name"] for x in items]
-                docs = [r["primary"]] if r["primary"] else []
-                docs += [n for n in names if re.search(r"ex[-_]?99", n, re.I)
-                         and n.lower().endswith((".htm", ".html", ".txt")) and n not in docs]
-                tot = {"words": 0, "neg": 0, "pos": 0, "unc": 0, "lit": 0}
-                for dname in docs[:4]:
-                    raw = get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{accn}/{dname}")
-                    if raw:
-                        for k, v in score(raw, lm).items():
-                            tot[k] += v
-                rec = {"ticker": tk, "cik": cik, **r, "ndocs": len(docs[:4]), **tot}
-                fo.write(json.dumps(rec) + "\n")
-                fo.flush()
-                done.add(r["acc"])
-                n_new += 1
+            todo = [r for r in rows if r["acc"] not in done]
+            with ThreadPoolExecutor(WORKERS) as ex:
+                for rec in ex.map(lambda r: one_filing(cik, tk, r, lm), todo):
+                    with wlock:
+                        fo.write(json.dumps(rec) + "\n")
+                        fo.flush()
+                        done.add(rec["acc"])
+                        n_new += 1
             if ti % 25 == 0:
                 el = time.time() - t0
                 print(f"  {ti}/{len(cmap)} 종목, 새 공시 {n_new}건, {el / 60:.0f}분", flush=True)
